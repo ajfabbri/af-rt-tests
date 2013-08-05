@@ -1,17 +1,35 @@
-# Object files
+*~
+.*
 *.o
-
-# Libraries
-*.lib
+*.tar.gz
+*.d
+*.patch
 *.a
+tmp
+patches
+ChangeLog
+releases
+BUILD
+RPMS
+SRPMS
 
-# Shared objects (inc. Windows DLLs)
-*.dll
-*.so
-*.so.*
-*.dylib
+#
+# Top-level programs
+#
+/classic_pi
+/pi_stress
+/cyclictest
+/signaltest
+/hwlatdetect
+/rt-migrate-test
+/ptsematest
+/sendme
+/sigwaittest
+/svsematest
+/pip_stress
+/hackbench
+/pmqtest
 
-# Executables
-*.exe
-*.out
-*.app
+rt-tests.spec
+tags
+TAGS
