@@ -26,6 +26,16 @@ static int numa = 0;
 #define LIBNUMA_API_VERSION 1
 #endif
 
+#if LIBNUMA_API_VERSION >= 2
+typedef struct bitmask rt_bitmask_t;
+#else
+typedef struct {
+	long *mask;
+	int size;
+} rt_bitmask_t;
+#endif
+
+
 static void *
 threadalloc(size_t size, int node)
 {
@@ -112,14 +122,77 @@ static void *rt_numa_numa_alloc_onnode(size_t size, int node, int cpu)
 	return stack;
 }
 
-#else
+/** Returns number of bits set in mask. */
+static inline unsigned int rt_numa_bitmask_count(const rt_bitmask_t *mask)
+{
+	unsigned int num_bits = 0, i;
+	for (i = 0; i < mask->size; i++) {
+		if (numa_bitmask_isbitset(mask, i))
+			num_bits++;
+	}
+	/* Could stash this instead of recomputing every time. */
+	return num_bits;
+}
 
+/* ajfabbri: I suggest removing libnuma v1 support. */
+static inline unsigned int rt_numa_bitmask_isbitset(
+	const rt_bitmask_t *affinity_mask, unsigned long i)
+{
+#if LIBNUMA_API_VERSION >= 2
+	return numa_bitmask_isbitset(affinity_mask, i);
+#else /* LIBNUMA_API_VERSION == 1 */
+	return test_bit(i, affinity_mask);
+#endif
+}
+
+static inline rt_bitmask_t* rt_numa_parse_cpustring(const char* s) 
+{
+#if LIBNUMA_API_VERSION >= 2
+
+#ifdef numa_parse_cpustring_all
+	return numa_parse_cpustring_all(s);
+#else
+	/* We really need numa_parse_cpustring_all(), so we can assign threads
+	 * to cores which are part of an isolcpus set, but early 2.x versions of
+	 * libnuma do not have this function.  A work around should be to run
+	 * your command with e.g. taskset -c 9-15 <command>
+	 */
+	return numa_parse_cpustring(s);
+#endif 
+
+#else /* LIBNUMA_API_VERSION == 1 */
+	rt_bitmask_t *mask = malloc(sizeof(*mask));
+	if (mask) 
+		mask->mask = cpumask(s, &mask->size);
+	return mask;
+#endif
+}
+
+static inline void rt_bitmask_free(rt_bitmask_t *mask)
+{
+#if LIBNUMA_API_VERSION >= 2
+	numa_bitmask_free(mask);
+#else /* LIBNUMA_API_VERSION == 1 */
+	free(mask->mask);
+	free(mask);
+#endif
+}
+
+#else /* ! NUMA */
+typedef struct { } rt_bitmask_t;
 static inline void *threadalloc(size_t size, int n) { return malloc(size); }
 static inline void threadfree(void *ptr, size_t s, int n) { free(ptr); }
 static inline void rt_numa_set_numa_run_on_node(int n, int c) { }
 static inline void numa_on_and_available() { };
 static inline int rt_numa_numa_node_of_cpu(int cpu) { return -1; }
 static void *rt_numa_numa_alloc_onnode(size_t s, int n, int c) { return NULL; }
+static inline unsigned int rt_numa_bitmask_isbitset(
+	const rt_bitmask_t *affinity_mask, unsigned long i) { return 0; }
+static inline rt_bitmask_t* rt_numa_parse_cpustring(const char* s) 
+{ return NULL; }
+static inline unsigned int rt_numa_bitmask_count(const rt_bitmask_t *mask)
+{ return 0; }
+static inline void rt_bitmask_free(rt_bitmask_t *mask) { return; }
 
 #endif	/* NUMA */
 

@@ -949,8 +949,12 @@ static void display_help(int error)
 	printf("cyclictest V %1.2f\n", VERSION_STRING);
 	printf("Usage:\n"
 	       "cyclictest <options>\n\n"
-	       "-a [NUM] --affinity        run thread #N on processor #N, if possible\n"
-	       "                           with NUM pin all threads to the processor NUM\n"
+	       "-a [CPUSET] --affinity     Run thread #N on processor #N, if possible, or if CPUSET\n"
+	       "                           given, pin threads to that set of processors in round-\n"
+	       "                           robin order.  E.g. -a 2 pins all threads to CPU 2,\n"
+	       "                           but -a 3-5,0 -t 5 will run the first and fifth\n"
+	       "                           threads on CPU (0),thread #2 on CPU 3, thread #3\n"
+	       "                           on CPU 4, and thread #5 on CPU 5.\n"
 	       "-b USEC  --breaktrace=USEC send break trace command when latency > USEC\n"
 	       "-B       --preemptirqs     both preempt and irqsoff tracing (used with -b)\n"
 	       "-c CLOCK --clock=CLOCK     select clock\n"
@@ -1022,7 +1026,7 @@ static int clocksel = 0;
 static int quiet;
 static int interval = DEFAULT_INTERVAL;
 static int distance = -1;
-static int affinity = 0;
+static rt_bitmask_t *affinity_mask = NULL;
 static int smp = 0;
 
 enum {
@@ -1036,6 +1040,50 @@ static int clocksources[] = {
 	CLOCK_MONOTONIC,
 	CLOCK_REALTIME,
 };
+
+static unsigned int is_cpumask_zero(const rt_bitmask_t *mask)
+{
+	return (rt_numa_bitmask_count(mask) == 0);
+}
+
+static int cpu_for_thread(int thread_num, int max_cpus)
+{
+	unsigned int m, cpu, i, num_cpus;
+	num_cpus = rt_numa_bitmask_count(affinity_mask);
+
+	m = thread_num % num_cpus;
+
+	/* there are num_cpus bits set, we want position of m'th one */
+	for (i = 0, cpu = 0; i < max_cpus; i++) {
+		if (rt_numa_bitmask_isbitset(affinity_mask, i)) {
+			if (cpu == m)
+				return i;
+			cpu++;
+		}
+	}
+	fprintf(stderr, "Bug in cpu mask handling code.\n");
+	return 0;
+}
+
+
+static void parse_cpumask(const char *option)
+{
+	affinity_mask = rt_numa_parse_cpustring(option);
+	if (affinity_mask) { 
+		if (is_cpumask_zero(affinity_mask)) {
+			rt_bitmask_free(affinity_mask);
+			affinity_mask = NULL;
+		}
+	}
+	if (!affinity_mask)
+		display_help(1);	
+
+	if (verbose) {
+		printf("%s: Using %u cpus.\n", __func__,
+			rt_numa_bitmask_count(affinity_mask));
+	}
+}
+
 
 static void handlepolicy(char *polname)
 {
@@ -1143,10 +1191,10 @@ static void process_options (int argc, char *argv[])
 			if (smp || numa)
 				break;
 			if (optarg != NULL) {
-				affinity = atoi(optarg);
+				parse_cpumask(optarg);
 				setaffinity = AFFINITY_SPECIFIED;
 			} else if (optind<argc && atoi(argv[optind])) {
-				affinity = atoi(argv[optind]);
+				parse_cpumask(argv[optind]);
 				setaffinity = AFFINITY_SPECIFIED;
 			} else {
 				setaffinity = AFFINITY_USEALL;
@@ -1262,15 +1310,7 @@ static void process_options (int argc, char *argv[])
 		}
 	}
 
-	if (setaffinity == AFFINITY_SPECIFIED) {
-		if (affinity < 0)
-			error = 1;
-		if (affinity >= max_cpus) {
-			warn("CPU #%d not found, only %d CPUs available\n",
-			    affinity, max_cpus);
-			error = 1;
-		}
-	} else if (tracelimit)
+	if (tracelimit)
 		fileprefix = procfileprefix;
 
 	if (clocksel < 0 || clocksel > ARRAY_SIZE(clocksources))
@@ -1318,8 +1358,11 @@ static void process_options (int argc, char *argv[])
 	if (num_threads < 1)
 		error = 1;
 
-	if (error)
+	if (error) {
+		if (affinity_mask)
+			rt_bitmask_free(affinity_mask);
 		display_help(1);
+	}
 }
 
 static int check_kernel(void)
@@ -1516,6 +1559,9 @@ int main(int argc, char **argv)
 
 	if (check_privs())
 		exit(EXIT_FAILURE);
+
+	if (verbose)
+		printf("Max CPUs = %d\n", max_cpus);
 
 	/* Checks if numa is on, program exits if numa on but not available */
 	numa_on_and_available();
@@ -1746,7 +1792,12 @@ int main(int argc, char **argv)
 		par->node = node;
 		switch (setaffinity) {
 		case AFFINITY_UNSPECIFIED: par->cpu = -1; break;
-		case AFFINITY_SPECIFIED: par->cpu = affinity; break;
+		case AFFINITY_SPECIFIED:
+			par->cpu = cpu_for_thread(i, max_cpus);
+			if (verbose)
+				printf("Thread %d using cpu %d.\n", i,
+					par->cpu);
+			break;
 		case AFFINITY_USEALL: par->cpu = i % max_cpus; break;
 		}
 		stat->min = 1000000;
@@ -1887,6 +1938,9 @@ int main(int argc, char **argv)
 	/* close the latency_target_fd if it's open */
 	if (latency_target_fd >= 0)
 		close(latency_target_fd);
+
+	if (affinity_mask)
+		rt_bitmask_free(affinity_mask);
 
 	exit(ret);
 }
