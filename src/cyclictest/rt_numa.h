@@ -149,7 +149,8 @@ static inline rt_bitmask_t* rt_numa_parse_cpustring(const char* s)
 {
 #if LIBNUMA_API_VERSION >= 2
 
-#ifdef numa_parse_cpustring_all
+#ifdef HAVE_PARSE_CPUSTRING_ALL		/* Currently not defined anywhere.  No
+					   autotools build. */
 	return numa_parse_cpustring_all(s);
 #else
 	/* We really need numa_parse_cpustring_all(), so we can assign threads
