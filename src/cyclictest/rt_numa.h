@@ -198,7 +198,7 @@ static inline void rt_bitmask_free(struct bitmask *mask)
 }
 
 #else /* ! NUMA */
-typedef struct { } struct bitmask;
+struct bitmask { };
 static inline void *threadalloc(size_t size, int n) { return malloc(size); }
 static inline void threadfree(void *ptr, size_t s, int n) { free(ptr); }
 static inline void rt_numa_set_numa_run_on_node(int n, int c) { }
@@ -207,7 +207,7 @@ static inline int rt_numa_numa_node_of_cpu(int cpu) { return -1; }
 static void *rt_numa_numa_alloc_onnode(size_t s, int n, int c) { return NULL; }
 static inline unsigned int rt_numa_bitmask_isbitset(
 	const struct bitmask *affinity_mask, unsigned long i) { return 0; }
-static inline struct bitmask* rt_numa_parse_cpustring(const char* s) 
+static inline struct bitmask* rt_numa_parse_cpustring(const char* s, int m) 
 { return NULL; }
 static inline unsigned int rt_numa_bitmask_count(const struct bitmask *mask)
 { return 0; }
