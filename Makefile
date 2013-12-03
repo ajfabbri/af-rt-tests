@@ -1,4 +1,4 @@
-VERSION_STRING = 0.85
+VERSION_STRING = 0.86
 
 sources = cyclictest.c signaltest.c pi_stress.c rt-migrate-test.c	\
 	  ptsematest.c sigwaittest.c svsematest.c pmqtest.c sendme.c 	\
@@ -111,9 +111,10 @@ clean:
 	rm -f hwlatdetect
 	rm -f tags
 
+RPMDIRS = BUILD BUILDROOT RPMS SRPMS SPECS
 .PHONY: distclean
 distclean: clean
-	rm -rf BUILD RPMS SRPMS releases *.tar.gz rt-tests.spec
+	rm -rf $(RPMDIRS) releases *.tar.gz rt-tests.spec tmp
 
 .PHONY: changelog
 changelog:
@@ -143,13 +144,16 @@ install: all
 	gzip src/hackbench/hackbench.8 -c >"$(DESTDIR)$(mandir)/man8/hackbench.8.gz"
 
 .PHONY: release
-release: clean changelog
+release: distclean changelog
 	mkdir -p releases
-	rm -rf tmp && mkdir -p tmp/rt-tests
+	mkdir -p tmp/rt-tests
 	cp -r Makefile COPYING ChangeLog src tmp/rt-tests
-	tar -C tmp -czf rt-tests-$(VERSION_STRING).tar.gz rt-tests
+	rm -f rt-tests-$(VERSION_STRING).tar rt-tests-$(VERSION_STRING).tar.asc
+	tar -C tmp -cf rt-tests-$(VERSION_STRING).tar rt-tests
+	gpg2 --default-key clrkwllms@kernel.org --detach-sign --armor rt-tests-$(VERSION_STRING).tar
+	gzip rt-tests-$(VERSION_STRING).tar
 	rm -f ChangeLog
-	cp rt-tests-$(VERSION_STRING).tar.gz releases
+	cp rt-tests-$(VERSION_STRING).tar.gz rt-tests-$(VERSION_STRING).tar.asc releases
 
 .PHONY: push
 push:	release
@@ -161,6 +165,14 @@ pushtest: release
 
 rt-tests.spec: Makefile rt-tests.spec-in
 	sed s/__VERSION__/$(VERSION_STRING)/ <$@-in >$@
+ifeq ($(NUMA),1)
+	sed -i -e 's/__MAKE_NUMA__/NUMA=1/' $@
+	sed -i -e 's/__BUILDREQUIRES_NUMA__/numactl-devel/' $@
+else
+	sed -i -e 's/__MAKE_NUMA__//' $@
+	sed -i -e 's/__BUILDREQUIRES_NUMA__//' $@
+endif
+
 
 HERE	:=	$(shell pwd)
 RPMARGS	:=	--define "_topdir $(HERE)" 	\
@@ -192,4 +204,4 @@ help:
 
 .PHONY: tags
 tags:
-	ctags -R --extra=+f --c-kinds=+p *
+	ctags -R --extra=+f --c-kinds=+p --exclude=tmp --exclude=BUILD *

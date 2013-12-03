@@ -1,6 +1,8 @@
 /*
  * High resolution timer test software
  *
+ * (C) 2013      Clark Williams <williams@redhat.com>
+ * (C) 2013      John Kacur <jkacur@redhat.com>
  * (C) 2008-2012 Clark Williams <williams@redhat.com>
  * (C) 2005-2007 Thomas Gleixner <tglx@linutronix.de>
  *
@@ -60,7 +62,7 @@
 #define CPUCLOCK_SCHED          2
 
 static int clock_nanosleep(clockid_t clock_id, int flags, const struct timespec *req,
-		struct timespec *rem)
+			   struct timespec *rem)
 {
 	if (clock_id == CLOCK_THREAD_CPUTIME_ID)
 		return -EINVAL;
@@ -71,7 +73,7 @@ static int clock_nanosleep(clockid_t clock_id, int flags, const struct timespec 
 }
 
 int sched_setaffinity (__pid_t __pid, size_t __cpusetsize,
-                              __const cpu_set_t *__cpuset)
+		       __const cpu_set_t *__cpuset)
 {
 	return -EINVAL;
 }
@@ -138,6 +140,7 @@ struct thread_param {
 	unsigned long interval;
 	int cpu;
 	int node;
+	int tnum;
 };
 
 /* Struct for statistics */
@@ -150,7 +153,7 @@ struct thread_stat {
 	double avg;
 	long *values;
 	long *hist_array;
-        long *outliers;
+	long *outliers;
 	pthread_t thread;
 	int threadstarted;
 	int tid;
@@ -158,11 +161,12 @@ struct thread_stat {
 	long redmax;
 	long cycleofmax;
 	long hist_overflow;
-        long num_outliers;
+	long num_outliers;
 };
 
 static int shutdown;
 static int tracelimit = 0;
+static int notrace = 0;
 static int ftrace = 0;
 static int kernelversion;
 static int verbose = 0;
@@ -178,6 +182,10 @@ static int force_sched_other;
 static int priospread = 0;
 static int check_clock_resolution;
 static int ct_debug;
+static int use_fifo = 0;
+static pthread_t fifo_threadid;
+static int aligned = 0;
+static int offset = 0;
 
 static pthread_cond_t refresh_on_max_cond = PTHREAD_COND_INITIALIZER;
 static pthread_mutex_t refresh_on_max_lock = PTHREAD_MUTEX_INITIALIZER;
@@ -185,6 +193,10 @@ static pthread_mutex_t refresh_on_max_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_mutex_t break_thread_id_lock = PTHREAD_MUTEX_INITIALIZER;
 static pid_t break_thread_id = 0;
 static uint64_t break_thread_value = 0;
+
+static pthread_barrier_t align_barr;
+static pthread_barrier_t globalt_barr;
+static struct timespec globalt;
 
 /* Backup of kernel variables that we modify */
 static struct kvars {
@@ -195,9 +207,15 @@ static struct kvars {
 static char *procfileprefix = "/proc/sys/kernel/";
 static char *fileprefix;
 static char tracer[MAX_PATH];
+static char fifopath[MAX_PATH];
 static char **traceptr;
 static int traceopt_count;
 static int traceopt_size;
+
+static struct thread_param **parameters;
+static struct thread_stat **statistics;
+
+static void print_stat(FILE *fp, struct thread_param *par, int index, int verbose, int quiet);
 
 static int latency_target_fd = -1;
 static int32_t latency_target_value = 0;
@@ -436,7 +454,7 @@ static int settracer(char *tracer)
 
 static void setup_tracer(void)
 {
-	if (!tracelimit)
+	if (!tracelimit || notrace)
 		return;
 
 	if (mount_debugfs(NULL))
@@ -504,12 +522,12 @@ static void setup_tracer(void)
 				ret = event_enable("sched/sched_switch");
 			}
 			break;
-               case WAKEUP:
-                       ret = settracer("wakeup");
-                       break;
-               case WAKEUPRT:
-                       ret = settracer("wakeup_rt");
-                       break;
+		case WAKEUP:
+			ret = settracer("wakeup");
+			break;
+		case WAKEUPRT:
+			ret = settracer("wakeup_rt");
+			break;
 		default:
 			if (strlen(tracer)) {
 				ret = settracer(tracer);
@@ -596,8 +614,7 @@ static void setup_tracer(void)
  *
  * the return value is a value in seconds
  */
-int
-parse_time_string(char *val)
+int parse_time_string(char *val)
 {
 	char *end;
 	int t = strtol(val, &end, 10);
@@ -758,7 +775,19 @@ void *timerthread(void *param)
 		fatal("timerthread%d: failed to set priority to %d\n", par->cpu, par->prio);
 
 	/* Get current time */
-	clock_gettime(par->clock, &now);
+	if(aligned){
+		pthread_barrier_wait(&globalt_barr);
+		if(par->tnum==0)
+			clock_gettime(par->clock, &globalt);
+		pthread_barrier_wait(&align_barr);
+		now = globalt;
+		if(offset) {
+			now.tv_nsec += offset * par->tnum;
+			tsnorm(&now);
+		}
+	}
+	else
+		clock_gettime(par->clock, &now);
 
 	next = now;
 	next.tv_sec += interval.tv_sec;
@@ -769,23 +798,20 @@ void *timerthread(void *param)
 		memset(&stop, 0, sizeof(stop)); /* grrr */
 		stop = now;
 		stop.tv_sec += duration;
-		tsnorm(&stop);
 	}
 	if (par->mode == MODE_CYCLIC) {
 		if (par->timermode == TIMER_ABSTIME)
 			tspec.it_value = next;
 		else {
-			tspec.it_value.tv_nsec = 0;
-			tspec.it_value.tv_sec = 1;
+			tspec.it_value = interval;
 		}
 		timer_settime(timer, par->timermode, &tspec, NULL);
 	}
 
 	if (par->mode == MODE_SYS_ITIMER) {
-		itimer.it_value.tv_sec = 1;
-		itimer.it_value.tv_usec = 0;
 		itimer.it_interval.tv_sec = interval.tv_sec;
 		itimer.it_interval.tv_usec = interval.tv_nsec / 1000;
+		itimer.it_value = itimer.it_interval;
 		setitimer (ITIMER_REAL, &itimer, NULL);
 	}
 
@@ -887,7 +913,7 @@ void *timerthread(void *param)
 		if (histogram) {
 			if (diff >= histogram) {
 				stat->hist_overflow++;
-                                if (stat->num_outliers < histogram)
+				if (stat->num_outliers < histogram)
 					stat->outliers[stat->num_outliers++] = stat->cycles;
 			}
 			else
@@ -960,6 +986,7 @@ static void display_help(int error)
 	       "-a [NUM] --affinity        run thread #N on processor #N, if possible\n"
 	       "                           with NUM pin all threads to the processor NUM\n"
 #endif
+	       "-A USEC  --aligned=USEC    align thread wakeups to a specific offset\n"
 	       "-b USEC  --breaktrace=USEC send break trace command when latency > USEC\n"
 	       "-B       --preemptirqs     both preempt and irqsoff tracing (used with -b)\n"
 	       "-c CLOCK --clock=CLOCK     select clock\n"
@@ -973,6 +1000,7 @@ static void display_help(int error)
 	       "-e       --latency=PM_QOS  write PM_QOS to /dev/cpu_dma_latency\n"
 	       "-E       --event           event tracing (used with -b)\n"
 	       "-f       --ftrace          function trace (when -b is active)\n"
+	       "-F       --fifo=<path>     create a named pipe at path and write stats to it\n"
 	       "-h       --histogram=US    dump a latency histogram to stdout after the run\n"
 	       "                           (with same priority about many threads)\n"
 	       "                           US is the max time to be be tracked in microseconds\n"
@@ -1131,6 +1159,18 @@ static char *policyname(int policy)
 }
 
 
+enum option_values {
+	OPT_AFFINITY=1, OPT_NOTRACE, OPT_BREAKTRACE, OPT_PREEMPTIRQ, OPT_CLOCK,
+	OPT_CONTEXT, OPT_DISTANCE, OPT_DURATION, OPT_LATENCY, OPT_EVENT,
+	OPT_FTRACE, OPT_FIFO, OPT_HISTOGRAM, OPT_HISTOFALL, OPT_INTERVAL,
+	OPT_IRQSOFF, OPT_LOOPS, OPT_MLOCKALL, OPT_REFRESH, OPT_NANOSLEEP,
+	OPT_NSECS, OPT_OSCOPE, OPT_TRACEOPT, OPT_PRIORITY, OPT_PREEMPTOFF,
+	OPT_QUIET, OPT_PRIOSPREAD, OPT_RELATIVE, OPT_RESOLUTION, OPT_SYSTEM,
+	OPT_SMP, OPT_THREADS, OPT_TRACER, OPT_UNBUFFERED, OPT_NUMA, OPT_VERBOSE,
+	OPT_WAKEUP, OPT_WAKEUPRT, OPT_DBGCYCLIC, OPT_POLICY, OPT_HELP, OPT_NUMOPTS,
+	OPT_ALIGNED,
+};
+
 /* Process commandline options */
 static void process_options (int argc, char *argv[], int max_cpus)
 {
@@ -1138,59 +1178,63 @@ static void process_options (int argc, char *argv[], int max_cpus)
 	int option_affinity = 0;
 
 	for (;;) {
- 		int option_index = 0;
+		int option_index = 0;
 		/*
 		 * Options for getopt
 		 * Ordered alphabetically by single letter name
 		 */
 		static struct option long_options[] = {
-			{"affinity",         optional_argument, NULL, 'a'},
-			{"breaktrace",       required_argument, NULL, 'b'},
-			{"preemptirqs",      no_argument,       NULL, 'B'},
-			{"clock",            required_argument, NULL, 'c'},
-			{"context",          no_argument,       NULL, 'C'},
-			{"distance",         required_argument, NULL, 'd'},
-			{"duration",         required_argument, NULL, 'D'},
-			{"latency",          required_argument, NULL, 'e'},
-			{"event",            no_argument,       NULL, 'E'},
-			{"ftrace",           no_argument,       NULL, 'f'},
-			{"histogram",        required_argument, NULL, 'h'},
-			{"histofall",        required_argument, NULL, 'H'},
-			{"interval",         required_argument, NULL, 'i'},
-			{"irqsoff",          no_argument,       NULL, 'I'},
-			{"loops",            required_argument, NULL, 'l'},
-			{"mlockall",         no_argument,       NULL, 'm'},
-			{"refresh_on_max",   no_argument,       NULL, 'M'},
-			{"nanosleep",        no_argument,       NULL, 'n'},
-			{"nsecs",            no_argument,       NULL, 'N'},
-			{"oscope",           required_argument, NULL, 'o'},
-			{"traceopt",         required_argument, NULL, 'O'},
-			{"priority",         required_argument, NULL, 'p'},
-			{"preemptoff",       no_argument,       NULL, 'P'},
-			{"quiet",            no_argument,       NULL, 'q'},
-			{"priospread",       no_argument,       NULL, 'Q'},
-			{"relative",         no_argument,       NULL, 'r'},
-			{"resolution",       no_argument,       NULL, 'R'},
-			{"system",           no_argument,       NULL, 's'},
-			{"smp",              no_argument,       NULL, 'S'},
-			{"threads",          optional_argument, NULL, 't'},
-			{"tracer",           required_argument, NULL, 'T'},
-			{"unbuffered",       no_argument,       NULL, 'u'},
-			{"numa",             no_argument,       NULL, 'U'},
-			{"verbose",          no_argument,       NULL, 'v'},
-			{"wakeup",           no_argument,       NULL, 'w'},
-			{"wakeuprt",         no_argument,       NULL, 'W'},
-			{"dbg_cyclictest",   no_argument,       NULL, 'X'},
-			{"policy",           required_argument, NULL, 'y'},
-			{"help",             no_argument,       NULL, '?'},
+			{"affinity",         optional_argument, NULL, OPT_AFFINITY},
+			{"notrace",          no_argument,       NULL, OPT_NOTRACE },
+			{"aligned",          optional_argument, NULL, OPT_ALIGNED },
+			{"breaktrace",       required_argument, NULL, OPT_BREAKTRACE },
+			{"preemptirqs",      no_argument,       NULL, OPT_PREEMPTIRQ },
+			{"clock",            required_argument, NULL, OPT_CLOCK },
+			{"context",          no_argument,       NULL, OPT_CONTEXT },
+			{"distance",         required_argument, NULL, OPT_DISTANCE },
+			{"duration",         required_argument, NULL, OPT_DURATION },
+			{"latency",          required_argument, NULL, OPT_LATENCY },
+			{"event",            no_argument,       NULL, OPT_EVENT },
+			{"ftrace",           no_argument,       NULL, OPT_FTRACE },
+			{"fifo",             required_argument, NULL, OPT_FIFO },
+			{"histogram",        required_argument, NULL, OPT_HISTOGRAM },
+			{"histofall",        required_argument, NULL, OPT_HISTOFALL },
+			{"interval",         required_argument, NULL, OPT_INTERVAL },
+			{"irqsoff",          no_argument,       NULL, OPT_IRQSOFF },
+			{"loops",            required_argument, NULL, OPT_LOOPS },
+			{"mlockall",         no_argument,       NULL, OPT_MLOCKALL },
+			{"refresh_on_max",   no_argument,       NULL, OPT_REFRESH },
+			{"nanosleep",        no_argument,       NULL, OPT_NANOSLEEP },
+			{"nsecs",            no_argument,       NULL, OPT_NSECS },
+			{"oscope",           required_argument, NULL, OPT_OSCOPE },
+			{"traceopt",         required_argument, NULL, OPT_TRACEOPT },
+			{"priority",         required_argument, NULL, OPT_PRIORITY },
+			{"preemptoff",       no_argument,       NULL, OPT_PREEMPTOFF },
+			{"quiet",            no_argument,       NULL, OPT_QUIET },
+			{"priospread",       no_argument,       NULL, OPT_PRIOSPREAD },
+			{"relative",         no_argument,       NULL, OPT_RELATIVE },
+			{"resolution",       no_argument,       NULL, OPT_RESOLUTION },
+			{"system",           no_argument,       NULL, OPT_SYSTEM },
+			{"smp",              no_argument,       NULL, OPT_SMP },
+			{"threads",          optional_argument, NULL, OPT_THREADS },
+			{"tracer",           required_argument, NULL, OPT_TRACER },
+			{"unbuffered",       no_argument,       NULL, OPT_UNBUFFERED },
+			{"numa",             no_argument,       NULL, OPT_NUMA },
+			{"verbose",          no_argument,       NULL, OPT_VERBOSE },
+			{"wakeup",           no_argument,       NULL, OPT_WAKEUP },
+			{"wakeuprt",         no_argument,       NULL, OPT_WAKEUPRT },
+			{"dbg_cyclictest",   no_argument,       NULL, OPT_DBGCYCLIC },
+			{"policy",           required_argument, NULL, OPT_POLICY },
+			{"help",             no_argument,       NULL, OPT_HELP },
 			{NULL, 0, NULL, 0}
 		};
-		int c = getopt_long(argc, argv, "a::b:Bc:Cd:D:e:Efh:H:i:Il:MnNo:O:p:PmqQrRsSt::uUvD:wWXT:y:",
+		int c = getopt_long(argc, argv, "a::A::b:Bc:Cd:D:Efh:H:i:Il:MnNo:O:p:PmqrRsSt::uUvD:wWT:",
 				    long_options, &option_index);
 		if (c == -1)
 			break;
 		switch (c) {
 		case 'a':
+		case OPT_AFFINITY:
 			option_affinity = 1;
 			if (smp || numa)
 				break;
@@ -1204,24 +1248,57 @@ static void process_options (int argc, char *argv[], int max_cpus)
 				setaffinity = AFFINITY_USEALL;
 			}
 			break;
-		case 'b': tracelimit = atoi(optarg); break;
-		case 'B': tracetype = PREEMPTIRQSOFF; break;
-		case 'c': clocksel = atoi(optarg); break;
-		case 'C': tracetype = CTXTSWITCH; break;
-		case 'd': distance = atoi(optarg); break;
-		case 'D': duration = parse_time_string(optarg); break;
-		case 'e': /* power management latency target value */
-			  /* note: default is 0 (zero) */
-			latency_target_value = atoi(optarg);
-			if (latency_target_value < 0)
-				latency_target_value = 0;
+		case 'A':
+		case OPT_ALIGNED:
+			aligned=1;
+			if (optarg != NULL)
+				offset = atoi(optarg);
+			else if (optind<argc && atoi(argv[optind]))
+				offset = atoi(argv[optind]);
+			else
+				offset = 0;
 			break;
-		case 'E': enable_events = 1; break;
-		case 'f': tracetype = FUNCTION; ftrace = 1; break;
-		case 'H': histofall = 1; /* fall through */
-		case 'h': histogram = atoi(optarg); break;
-		case 'i': interval = atoi(optarg); break;
+		case 'b':
+		case OPT_BREAKTRACE:
+			tracelimit = atoi(optarg); break;
+		case 'B':
+		case OPT_PREEMPTIRQ:
+			tracetype = PREEMPTIRQSOFF; break;
+		case 'c':
+		case OPT_CLOCK:
+			clocksel = atoi(optarg); break;
+		case 'C':
+		case OPT_CONTEXT:
+			tracetype = CTXTSWITCH; break;
+		case 'd':
+		case OPT_DISTANCE:
+			distance = atoi(optarg); break;
+		case 'D':
+		case OPT_DURATION:
+			duration = parse_time_string(optarg); break;
+		case 'E':
+		case OPT_EVENT:
+			enable_events = 1; break;
+		case 'f':
+		case OPT_FTRACE:
+			tracetype = FUNCTION; ftrace = 1; break;
+		case 'F': 
+		case OPT_FIFO:
+			use_fifo = 1; 
+			strncpy(fifopath, optarg, strlen(optarg));
+			break;
+
+		case 'H':
+		case OPT_HISTOFALL:
+			histofall = 1; /* fall through */
+		case 'h':
+		case OPT_HISTOGRAM:
+			histogram = atoi(optarg); break;
+		case 'i':
+		case OPT_INTERVAL:
+			interval = atoi(optarg); break;
 		case 'I':
+		case OPT_IRQSOFF:
 			if (tracetype == PREEMPTOFF) {
 				tracetype = PREEMPTIRQSOFF;
 				strncpy(tracer, "preemptirqsoff", sizeof(tracer));
@@ -1230,19 +1307,35 @@ static void process_options (int argc, char *argv[], int max_cpus)
 				strncpy(tracer, "irqsoff", sizeof(tracer));
 			}
 			break;
-		case 'l': max_cycles = atoi(optarg); break;
-		case 'm': lockall = 1; break;
-		case 'M': refresh_on_max = 1; break;
-		case 'n': use_nanosleep = MODE_CLOCK_NANOSLEEP; break;
-		case 'N': use_nsecs = 1; break;
-		case 'o': oscope_reduction = atoi(optarg); break;
-		case 'O': traceopt(optarg); break;
+		case 'l':
+		case OPT_LOOPS:
+			max_cycles = atoi(optarg); break;
+		case 'm':
+		case OPT_MLOCKALL:
+			lockall = 1; break;
+		case 'M':
+		case OPT_REFRESH:
+			refresh_on_max = 1; break;
+		case 'n':
+		case OPT_NANOSLEEP:
+			use_nanosleep = MODE_CLOCK_NANOSLEEP; break;
+		case 'N':
+		case OPT_NSECS:
+			use_nsecs = 1; break;
+		case 'o':
+		case OPT_OSCOPE:
+			oscope_reduction = atoi(optarg); break;
+		case 'O':
+		case OPT_TRACEOPT:
+			traceopt(optarg); break;
 		case 'p':
+		case OPT_PRIORITY:
 			priority = atoi(optarg);
 			if (policy != SCHED_FIFO && policy != SCHED_RR)
 				policy = SCHED_FIFO;
 			break;
 		case 'P':
+		case OPT_PREEMPTOFF:
 			if (tracetype == IRQSOFF) {
 				tracetype = PREEMPTIRQSOFF;
 				strncpy(tracer, "preemptirqsoff", sizeof(tracer));
@@ -1251,12 +1344,20 @@ static void process_options (int argc, char *argv[], int max_cpus)
 				strncpy(tracer, "preemptoff", sizeof(tracer));
 			}
 			break;
-		case 'q': quiet = 1; break;
-		case 'Q': priospread = 1; break;
-		case 'r': timermode = TIMER_RELTIME; break;
-		case 'R': check_clock_resolution = 1; break;
-		case 's': use_system = MODE_SYS_OFFSET; break;
-		case 'S':  /* SMP testing */
+		case 'q':
+		case OPT_QUIET:
+			quiet = 1; break;
+		case 'r':
+		case OPT_RELATIVE:
+			timermode = TIMER_RELTIME; break;
+		case 'R':
+		case OPT_RESOLUTION:
+			check_clock_resolution = 1; break;
+		case 's':
+		case OPT_SYSTEM:
+			use_system = MODE_SYS_OFFSET; break;
+		case 'S':
+		case OPT_SMP: /* SMP testing */
 			if (numa)
 				fatal("numa and smp options are mutually exclusive\n");
 			smp = 1;
@@ -1265,6 +1366,7 @@ static void process_options (int argc, char *argv[], int max_cpus)
 			use_nanosleep = MODE_CLOCK_NANOSLEEP;
 			break;
 		case 't':
+		case OPT_THREADS:
 			if (smp) {
 				warn("-t ignored due to --smp\n");
 				break;
@@ -1277,11 +1379,15 @@ static void process_options (int argc, char *argv[], int max_cpus)
 				num_threads = max_cpus;
 			break;
 		case 'T':
+		case OPT_TRACER:
 			tracetype = CUSTOM;
 			strncpy(tracer, optarg, sizeof(tracer));
 			break;
-		case 'u': setvbuf(stdout, NULL, _IONBF, 0); break;
-		case 'U':  /* NUMA testing */
+		case 'u':
+		case OPT_UNBUFFERED:
+			setvbuf(stdout, NULL, _IONBF, 0); break;
+		case 'U':
+		case OPT_NUMA: /* NUMA testing */
 			if (smp)
 				fatal("numa and smp options are mutually exclusive\n");
 #ifdef NUMA
@@ -1296,13 +1402,34 @@ static void process_options (int argc, char *argv[], int max_cpus)
 			warn("ignoring --numa or -U\n");
 #endif
 			break;
-		case 'v': verbose = 1; break;
-		case 'w': tracetype = WAKEUP; break;
-		case 'W': tracetype = WAKEUPRT; break;
-		case 'X': ct_debug = 1; break;
-		case 'y': handlepolicy(optarg); break;
+		case 'v':
+		case OPT_VERBOSE: verbose = 1; break;
+		case 'w':
+		case OPT_WAKEUP:
+			tracetype = WAKEUP; break;
+		case 'W':
+		case OPT_WAKEUPRT:
+			tracetype = WAKEUPRT; break;
+		case '?':
+		case OPT_HELP:
+			display_help(0); break;
 
-		case '?': display_help(0); break;
+		/* long only options */
+		case OPT_PRIOSPREAD:
+			priospread = 1; break;
+		case OPT_LATENCY:
+                          /* power management latency target value */
+			  /* note: default is 0 (zero) */
+			latency_target_value = atoi(optarg);
+			if (latency_target_value < 0)
+				latency_target_value = 0;
+			break;
+		case OPT_NOTRACE:
+			notrace = 1; break;
+		case OPT_POLICY:
+			handlepolicy(optarg); break;
+		case OPT_DBGCYCLIC:
+			ct_debug = 1; break;
 		}
 	}
 
@@ -1362,6 +1489,11 @@ static void process_options (int argc, char *argv[], int max_cpus)
 	if (num_threads < 1)
 		error = 1;
 
+	if (aligned) {
+		pthread_barrier_init(&globalt_barr, NULL, num_threads);
+		pthread_barrier_init(&align_barr, NULL, num_threads);
+	}
+
 	if (error) {
 		if (affinity_mask)
 			rt_bitmask_free(affinity_mask);
@@ -1418,10 +1550,23 @@ static int check_timer(void)
 
 static void sighand(int sig)
 {
+	if (sig == SIGUSR1) {
+		int i;
+		int oldquiet = quiet;
+
+		quiet = 0;
+		printf("#---------------------------\n");
+		printf("# cyclictest current status:\n");
+		for (i = 0; i < num_threads; i++)
+			print_stat(stdout, parameters[i], i, 0, 0);
+		printf("#---------------------------\n");
+		quiet = oldquiet;
+		return;
+	}
 	shutdown = 1;
 	if (refresh_on_max)
 		pthread_cond_signal(&refresh_on_max_cond);
-	if (tracelimit)
+	if (tracelimit && !notrace)
 		tracing(0);
 }
 
@@ -1510,7 +1655,7 @@ static void print_hist(struct thread_param *par[], int nthreads)
 	printf("\n");
 }
 
-static void print_stat(struct thread_param *par, int index, int verbose)
+static void print_stat(FILE *fp, struct thread_param *par, int index, int verbose, int quiet)
 {
 	struct thread_stat *stat = par->stats;
 
@@ -1518,15 +1663,15 @@ static void print_stat(struct thread_param *par, int index, int verbose)
 		if (quiet != 1) {
 			char *fmt;
 			if (use_nsecs)
-                                fmt = "T:%2d (%5d) P:%2d I:%ld C:%7lu "
+				fmt = "T:%2d (%5d) P:%2d I:%ld C:%7lu "
 					"Min:%7ld Act:%8ld Avg:%8ld Max:%8ld\n";
 			else
-                                fmt = "T:%2d (%5d) P:%2d I:%ld C:%7lu "
+				fmt = "T:%2d (%5d) P:%2d I:%ld C:%7lu "
 					"Min:%7ld Act:%5ld Avg:%5ld Max:%8ld\n";
-                        printf(fmt, index, stat->tid, par->prio,
-                               par->interval, stat->cycles, stat->min, stat->act,
-			       stat->cycles ?
-			       (long)(stat->avg/stat->cycles) : 0, stat->max);
+			fprintf(fp, fmt, index, stat->tid, par->prio,
+				par->interval, stat->cycles, stat->min, stat->act,
+				stat->cycles ?
+				(long)(stat->avg/stat->cycles) : 0, stat->max);
 		}
 	} else {
 		while (stat->cycles != stat->cyclesread) {
@@ -1538,8 +1683,8 @@ static void print_stat(struct thread_param *par, int index, int verbose)
 				stat->cycleofmax = stat->cyclesread;
 			}
 			if (++stat->reduce == oscope_reduction) {
-				printf("%8d:%8lu:%8ld\n", index,
-				       stat->cycleofmax, stat->redmax);
+				fprintf(fp, "%8d:%8lu:%8ld\n", index,
+					stat->cycleofmax, stat->redmax);
 				stat->reduce = 0;
 				stat->redmax = 0;
 			}
@@ -1548,13 +1693,49 @@ static void print_stat(struct thread_param *par, int index, int verbose)
 	}
 }
 
+
+/* 
+ * thread that creates a named fifo and hands out run stats when someone
+ * reads from the fifo.
+ */
+void *fifothread(void *param)
+{
+	int ret;
+	int fd;
+	FILE *fp;
+	int i;
+
+	if (use_fifo == 0)
+		return NULL;
+
+	unlink(fifopath);
+	ret = mkfifo(fifopath, 0666);
+	if (ret) {
+		fprintf(stderr, "Error creating fifo %s: %s\n", fifopath, strerror(errno));
+		return NULL;
+	}
+	while (!shutdown) {
+		fd = open(fifopath, O_WRONLY|O_NONBLOCK);
+		if (fd < 0) {
+			usleep(500000);
+			continue;
+		}
+		fp = fdopen(fd, "w");
+		for (i=0; i < num_threads; i++)
+			print_stat(fp, parameters[i], i, 0, 0);
+		fclose(fp);
+		usleep(250);
+	}
+	unlink(fifopath);
+	return NULL;
+}
+
+
 int main(int argc, char **argv)
 {
 	sigset_t sigset;
 	int signum = SIGALRM;
 	int mode;
-	struct thread_param **parameters;
-	struct thread_stat **statistics;
 	int max_cpus = sysconf(_SC_NPROCESSORS_CONF);
 	int i, ret = -1;
 	int status;
@@ -1695,6 +1876,7 @@ int main(int argc, char **argv)
 
 	signal(SIGINT, sighand);
 	signal(SIGTERM, sighand);
+	signal(SIGUSR1, sighand);
 
 	parameters = calloc(num_threads, sizeof(struct thread_param *));
 	if (!parameters)
@@ -1774,9 +1956,9 @@ int main(int argc, char **argv)
 		}
 
 		par->prio = priority;
-                if (priority && (policy == SCHED_FIFO || policy == SCHED_RR))
+		if (priority && (policy == SCHED_FIFO || policy == SCHED_RR))
 			par->policy = policy;
-                else {
+		else {
 			par->policy = SCHED_OTHER;
 			force_sched_other = 1;
 		}
@@ -1794,6 +1976,7 @@ int main(int argc, char **argv)
 		par->max_cycles = max_cycles;
 		par->stats = stat;
 		par->node = node;
+		par->tnum = i;
 		switch (setaffinity) {
 		case AFFINITY_UNSPECIFIED: par->cpu = -1; break;
 		case AFFINITY_SPECIFIED:
@@ -1813,6 +1996,8 @@ int main(int argc, char **argv)
 			fatal("failed to create thread %d: %s\n", i, strerror(status));
 
 	}
+	if (use_fifo)
+		status = pthread_create(&fifo_threadid, NULL, fifothread, NULL);
 
 	while (!shutdown) {
 		char lavg[256];
@@ -1842,7 +2027,7 @@ int main(int argc, char **argv)
 
 		for (i = 0; i < num_threads; i++) {
 
-			print_stat(parameters[i], i, verbose);
+			print_stat(stdout, parameters[i], i, verbose, quiet);
 			if(max_cycles && statistics[i]->cycles >= max_cycles)
 				allstopped++;
 		}
@@ -1874,7 +2059,7 @@ int main(int argc, char **argv)
 		if (statistics[i]->threadstarted) {
 			pthread_join(statistics[i]->thread, NULL);
 			if (quiet && !histogram)
-				print_stat(parameters[i], i, 0);
+				print_stat(stdout, parameters[i], i, 0, 0);
 		}
 		if (statistics[i]->values)
 			threadfree(statistics[i]->values, VALBUF_SIZE*sizeof(long), parameters[i]->node);
@@ -1911,7 +2096,7 @@ int main(int argc, char **argv)
 	}
  out:
 	/* ensure that the tracer is stopped */
-	if (tracelimit)
+	if (tracelimit && !notrace)
 		tracing(0);
 
 
@@ -1927,7 +2112,7 @@ int main(int argc, char **argv)
 
 	/* turn off the function tracer */
 	fileprefix = procfileprefix;
-	if (tracetype)
+	if (tracetype && !notrace)
 		setkernvar("ftrace_enabled", "0");
 	fileprefix = get_debugfileprefix();
 
