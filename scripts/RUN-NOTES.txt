@@ -1,0 +1,164 @@
+****************************************
+		cyclictest
+****************************************
+
+- WR-based 3.4 kernel, preempt_rt.  Dual socket x 8 core (16 total).
+- host irqs on 0, guest on vcpu 0 
+- vcpu:cpu mappings = {0:9, 1:10:, 2:11, 3:12}
+- qemu 1.4.0 + WRL patches
+
+iso-g-ct-1377047688.out ********************
+- host and guest idle
+
+iso-g-ct-1377048014.out	********************
+- guest-rt-stress.sh only (no load on host)
+
+iso-g-ct-1377048419.out
+
+- guest rt-stress + spinner on host cpu 2 and 6:
+
+fabbri@wck-enodeb:~/sda5/fabbri/Dev$ for i in 2 6
+> do
+> nice spinner/spinner &
+> done
+
+iso-g-ct-1377306111.out
+- prioritized ksoftirqd/10
+
+iso-g-ct-1377558598.out
+- 3.10.6-rt5 kernel (stock rt), prioritized ksoftirqd
+** Perf without logging is much better (5 minute run)
+Starting taskset -c 1-3 cyclictest -l200000 -i1000  -q -p95 -a 1-3 -n -m
+T: 0 ( 1012) P:95 I:1000 C: 200000 Min:      4 Act:   14 Avg:   13 Max:      22
+
+**** with hard irq kvmlapic htrimer:  (very unstable)
+fabbri@wc-guest1:~/sda5/fabbri/Dev/af-rt-tests/scripts$ sudo taskset -c 1-3
+cyclictest -l10000 -i1000  -q -p95 -a 1-3 -n -m
+# /dev/cpu_dma_latency set to 0us
+T: 0 (  938) P:95 I:1000 C:  10000 Min:     11 Act:   13 Avg:   12 Max:      20
+
+
+*** with host on 3.2. kernel from linutronx, prios 0 0 80 80 80, thread 1 pinned
+*** to 14
+Starting taskset -c 1-3 cyclictest -l100000 -i1000  -q -p95 -a 1-3 -n -m
+# /dev/cpu_dma_latency set to 0us
+T: 0 (  939) P:95 I:1000 C: 100000 Min:      3 Act:   10 Avg:    9 Max:      23
+
+*** Same setup, with prios 79 0 80 80 80
+
+*** OOPS: not RT Change guest only to 3.10 yocto + isol + nohz_full=1-3.
+T: 0 ( 1577) P:95 I:1000 C:  10000 Min:     10 Act:   13 Avg:   13 Max:      32
+*** OOPS: not RT w/ load (spinner 1-3),
+T: 0 ( 1569) P:95 I:1000 C:  10000 Min:     28 Act:   30 Avg:   30 Max:      73
+
+**** Host & Guest with 3.10.10-rt3 (yocto), otherwise same
+ 	sudo ./set-qemu-prio.sh cvmplus  79 0 80 80 80 0
+	$ MAIN_PID=`./ps-qemu-tid.sh cvm | head -1`
+	$ sudo taskset -p -c 14 $MAIN_PID
+	pid 3316's current affinity list: 0-15
+	pid 3316's new affinity list: 14
+
+T: 0 ( 1116) P:95 I:1000 C:  20000 Min:     13 Act:   24 Avg:   24 Max:      57
+
+*** sudo ./set-qemu-prio.sh cvmplus  0 0 80 80 80 0
+T: 0 ( 1171) P:95 I:1000 C:  20000 Min:     13 Act:   23 Avg:   23 Max:      53
+
+*** sudo ./set-qemu-prio.sh cvmplus  81 0 80 80 80 0
+T: 0 (20008) P:95 I:1000 C:  50000 Min:      8 Act:   15 Avg:   16 Max:      38
+
+##  think hrtimer in guest may be busted..  rebooting guest to previous os
+*** guest reboot ->	3.4.34-ovp-ga-rt40-WR5.0.1.6_preempt-rt
+T: 0 ( 1171) P:95 I:1000 C:  20000 Min:     13 Act:   23 Avg:   23 Max:      53
+
+
+****************************************
+		LatencyTest
+****************************************
+----------------------------------------
+New Userspace Test
+----------------------------------------
+
+On bare metal, see documentation/ howto.
+
+
+----------------------------------------
+Old Code first runs
+----------------------------------------
+- host (bare metal) 3.10.10-rt3
+- irq on isolated cpu: echo 9 | sudo tee /proc/irq/152/smp_affinity_list
+Period is 1000 us
+Latency is Min: 1.36us Max: 16.46us Avg: 1.43us
+Jitter is Min: 987.45us Max: 1017.62us Avg: 1002.51us
+No of interrupts = 177932
+
+Period is 1000 us
+Latency is Min: 1.35us Max: 18.58us Avg: 1.43us
+Jitter is Min: 985.33us Max: 1019.74us Avg: 1002.51us
+No of interrupts = 8464825
+   almost 3 hours
+
+- guest (both 3.10.10-rt3)
+	- crashes rt_spin_lock_slowlock see Devnotes/Bugs
+
+- guest & host 3.4.24 WRL isol
+  - set qemu priorities 79 0 80 80 80
+  - moved first qemu tid to cpu 14
+  - echo 9 | sudo tee /proc/irq/152/smp_affinity_list
+
+  Period is 1000 us
+  Latency is Min: 6.21us Max: 40.89us Avg: 8.86us
+  Jitter is Min: 971.00us Max: 1034.63us Avg: 1002.51us
+  No of interrupts = 121437
+
+- Also, on guest  echo 1 | sudo tee /proc/irq/43/smp_affinity_list
+- and on host, put it on 10
+- taskset -c 1 of testLatency
+- No load
+Period is 1000 us
+Latency is Min: 6.32us Max: 42.23us Avg: 8.99us
+Jitter is Min: 974.22us Max: 1026.04us Avg: 1002.51us
+No of interrupts = 104468
+
+- Add load (spinner on vcpu 1-3 shows vcpu % 16)
+Period is 1000 us
+Latency is Min: 6.20us Max: 45.85us Avg: 10.45us
+Jitter is Min: 969.00us Max: 1035.04us Avg: 1002.51us
+No of interrupts = 2372292
+
+Period is 1000 us
+Latency is Min: 6.10us Max: 47.05us Avg: 10.45us
+Jitter is Min: 967.81us Max: 1039.85us Avg: 1002.51us
+No of interrupts = 43166828
+
+Period is 1000 us
+Latency is Min: 6.10us Max: 50.12us Avg: 10.45us
+Jitter is Min: 963.13us Max: 1042.05us Avg: 1002.51us
+No of interrupts = 86010022
+
+
+
+****************************************
+ w/ ftrace debugfs	LatencyTest
+****************************************
+
+See wcbase:sda5/fabbri/Traces/
+
+** With 3.10.10-rt7dfs, userspace testLatency, no VM **
+
+func.trace.gz, func2.trace.gz
+	- Show a spike in latency (see annotated-func2.trace), but actual hard
+	  IRQ -> userspace path was small.  E.g. 65 usec spike, 25 usec round
+	  trip to userspace.
+
+
+irqoff.trace, irqoff2.trace, irqoff-soft.trace
+	- irqsoff tracing, with test's spike # roughly matching the max latency
+	  shown by ftrace
+	 - With hard ISR, then soft
+
+Disable tracers, get performance: do_user_test.sh
+	- non-verbose (summary) run: (still see spikes)
+
+	# fpga_hw_delta_usec: min 4.82, max 134.13, avg 5.19
+
+	-> Either 3.10.10-rt7 specific, or debugfs + tracing artifact
