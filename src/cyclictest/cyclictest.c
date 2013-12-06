@@ -987,6 +987,7 @@ static void display_help(int error)
 	       "                           with NUM pin all threads to the processor NUM\n"
 #endif
 	       "-A USEC  --aligned=USEC    align thread wakeups to a specific offset\n"
+#endif
 	       "-b USEC  --breaktrace=USEC send break trace command when latency > USEC\n"
 	       "-B       --preemptirqs     both preempt and irqsoff tracing (used with -b)\n"
 	       "-c CLOCK --clock=CLOCK     select clock\n"
